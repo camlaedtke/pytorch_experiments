@@ -1,4 +1,5 @@
 import cv2
+import mmcv
 import torch
 import random
 import numpy as np
@@ -19,10 +20,12 @@ def normalize_01(inp: np.ndarray):
     return inp_out
 
 
-def normalize(inp: np.ndarray, mean: float, std: float):
+def normalize(img: np.ndarray, mean: float, std: float):
     """Normalize based on mean and standard deviation."""
-    inp_out = (inp - mean) / std
-    return inp_out
+    img = img.astype(np.float32) / 255
+    img = img - mean
+    img = img / std
+    return img
 
 
 def create_dense_target(tar: np.ndarray):
@@ -42,7 +45,6 @@ def label_mapping(seg: np.ndarray, label_map: dict, inverse=False):
             seg[temp == k] = v
     else:
         for k, v in label_map.items():
-            # print(v)
             seg[temp == k] = v
     return seg
 
@@ -97,11 +99,36 @@ def pad_image(img, h, w, size, padvalue):
     return pad_image
 
 
+def pad_seg(img, h, w, size, padvalue):
+    pad_image = img.copy()
+    pad_h = max(size[0] - h, 0)
+    pad_w = max(size[1] - w, 0)
+    if pad_h > 0 or pad_w > 0:
+        pad_image = cv2.copyMakeBorder(img, 0, pad_h, 0, pad_w, cv2.BORDER_CONSTANT, value=padvalue)
+        pad_image = np.expand_dims(pad_image, 2)
+    return pad_image
+
+
+def _resize_img(img, scale, keep_ratio=True, interp="nearest"):
+    """Resize images with ``results['scale']``."""
+    if keep_ratio:
+        new_img, scale_factor = mmcv.imrescale(img, scale, return_scale=True, interpolation=interp)
+
+        new_h, new_w = new_img.shape[:2]
+        h, w = img.shape[:2]
+        w_scale = new_w / w
+        h_scale = new_h / h
+    else:
+        new_img, w_scale, h_scale = mmcv.imresize(img, scale, return_scale=True, interpolation=interp)
+    
+    return new_img
+
+
 def rand_crop(img, seg, crop_size, ignore_label):
     h, w = img.shape[:-1]
     img = pad_image(img, h, w, crop_size, (0.0, 0.0, 0.0))
-    seg = pad_image(seg, h, w, crop_size, (ignore_label,))
-
+    seg = pad_seg(seg, h, w, crop_size, (ignore_label,))
+    #print(seg.shape)
     new_h, new_w = seg.shape[:-1]
     x = random.randint(0, new_w - crop_size[1])
     y = random.randint(0, new_h - crop_size[0])
@@ -110,13 +137,13 @@ def rand_crop(img, seg, crop_size, ignore_label):
 
     return img, seg
 
-def multi_scale_aug(img, seg, valid=False, scale_factor=1, crop_size=(512, 1024), base_size=(1024, 2048), ignore_label=-1):
-    print(img.shape)
+
+def multi_scale_aug(img, seg=None, valid=False, scale_factor=1, crop_size=(512, 1024),
+                    base_size=(1024, 2048), ignore_label=-1):
     if valid:
         h, w = crop_size
         img = cv2.resize(img, (w, h), interpolation=cv2.INTER_LINEAR)        
         seg = cv2.resize(seg, (w, h), interpolation=cv2.INTER_NEAREST)
-        #img = img[:, :, ::-1]
         seg = np.expand_dims(seg, 2)
         return img, seg
         
@@ -129,14 +156,50 @@ def multi_scale_aug(img, seg, valid=False, scale_factor=1, crop_size=(512, 1024)
     else:
         new_w = long_size
         new_h = np.int(h * long_size / w + 0.5)
-
+    # print(new_h, new_w)
     img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)        
     seg = cv2.resize(seg, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
     seg = np.expand_dims(seg, 2)
 
     img, seg = rand_crop(img, seg, crop_size=crop_size, ignore_label=ignore_label)
-    #img = img[:, :, ::-1]
     return img, seg
+
+# def scale_aug(
+#     img, 
+#     seg=None, 
+#     valid=False, 
+#     scale_factor=1, 
+#     crop_size=(512, 1024),
+#     base_size=(1024, 2048), 
+#     ignore_label=-1
+# ):
+#     if valid:
+#         h, w = crop_size
+#         img =  _resize_img(img, crop_size, keep_ratio=True)
+#         # img = cv2.resize(img, (w, h), interpolation=cv2.INTER_LINEAR)        
+#         seg = cv2.resize(seg, (w, h), interpolation=cv2.INTER_NEAREST)
+#         seg = np.expand_dims(seg, 2)
+#         return img, seg
+        
+#     rand_scale = 0.5 + random.randint(0, scale_factor) / 10.0
+#     long_size = np.int(base_size * rand_scale + 0.5)
+#     h, w = img.shape[:2]
+#     if h > w:
+#         new_h = long_size
+#         new_w = np.int(w * long_size / h + 0.5)
+#     else:
+#         new_w = long_size
+#         new_h = np.int(h * long_size / w + 0.5)
+#     # print(new_h, new_w)
+#     img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)        
+#     seg = cv2.resize(seg, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+#     seg = np.expand_dims(seg, 2)
+
+#     img, seg = rand_crop(img, seg, crop_size=crop_size, ignore_label=ignore_label)
+#     return img, seg
+
+
+
 
 
 def random_brightness(img, brightness_shift_value=10):
@@ -148,8 +211,8 @@ def random_brightness(img, brightness_shift_value=10):
     img = np.around(img)
     img = np.clip(img, 0, 255).astype(np.uint8)
     return img
-                    
-                    
+
+
 class Repr:
     """Evaluable string representation of an object"""
 

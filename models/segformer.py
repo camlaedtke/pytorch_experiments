@@ -1,194 +1,83 @@
-from math import sqrt
-from functools import partial
 import torch
-from torch import nn, einsum
+from torch import nn
 import torch.nn.functional as F
+from functools import partial
+from models.mix_transformer import mit_b5
 
-from einops import rearrange, reduce
-from einops.layers.torch import Rearrange
 
-# helpers
-
-def exists(val):
-    return val is not None
 
 def cast_tuple(val, depth):
     return val if isinstance(val, tuple) else (val,) * depth
 
-LayerNorm = partial(nn.InstanceNorm2d, affine = True)
 
-# classes
-
-class DsConv2d(nn.Module):
-    def __init__(self, dim_in, dim_out, kernel_size, padding, stride = 1, bias = True):
+class MLP(nn.Module):
+    """
+    Linear Embedding
+    """
+    def __init__(self, input_dim=2048, embed_dim=768):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(dim_in, dim_in, kernel_size = kernel_size, padding = padding, 
-                      groups = dim_in, stride = stride, bias = bias),
-            nn.Conv2d(dim_in, dim_out, kernel_size = 1, bias = bias)
-        )
-    def forward(self, x):
-        return self.net(x)
-
-class PreNorm(nn.Module):
-    def __init__(self, dim, fn):
-        super().__init__()
-        self.fn = fn
-        self.norm = LayerNorm(dim)
+        self.proj = nn.Linear(input_dim, embed_dim)
 
     def forward(self, x):
-        return self.fn(self.norm(x))
-
-class EfficientSelfAttention(nn.Module):
-    def __init__(
-        self,
-        *,
-        dim,
-        heads,
-        reduction_ratio
-    ):
-        super().__init__()
-        self.scale = (dim // heads) ** -0.5
-        self.heads = heads
-
-        self.to_q = nn.Conv2d(dim, dim, 1, bias = False)
-        self.to_kv = nn.Conv2d(dim, dim * 2, reduction_ratio, stride = reduction_ratio, bias = False)
-        self.to_out = nn.Conv2d(dim, dim, 1, bias = False)
-
-    def forward(self, x):
-        h, w = x.shape[-2:]
-        heads = self.heads
-
-        q, k, v = (self.to_q(x), *self.to_kv(x).chunk(2, dim = 1))
-        q, k, v = map(lambda t: rearrange(t, 'b (h c) x y -> (b h) (x y) c', h = heads), (q, k, v))
-
-        sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
-        attn = sim.softmax(dim = -1)
-
-        out = einsum('b i j, b j d -> b i d', attn, v)
-        out = rearrange(out, '(b h) (x y) c -> b (h c) x y', h = heads, x = h, y = w)
-        return self.to_out(out)
-
-class MixFeedForward(nn.Module):
-    def __init__(
-        self,
-        *,
-        dim,
-        expansion_factor
-    ):
-        super().__init__()
-        hidden_dim = dim * expansion_factor
-        self.net = nn.Sequential(
-            nn.Conv2d(dim, hidden_dim, 1),
-            DsConv2d(hidden_dim, hidden_dim, 3, padding = 1),
-            nn.GELU(),
-            nn.Conv2d(hidden_dim, dim, 1)
-        )
-
-    def forward(self, x):
-        return self.net(x)
-
-class MiT(nn.Module):
-    def __init__(
-        self,
-        *,
-        channels,
-        dims,
-        heads,
-        ff_expansion,
-        reduction_ratio,
-        num_layers
-    ):
-        super().__init__()
-        stage_kernel_stride_pad = ((7, 4, 3), (3, 2, 1), (3, 2, 1), (3, 2, 1))
-
-        dims = (channels, *dims)
-        dim_pairs = list(zip(dims[:-1], dims[1:]))
-
-        self.stages = nn.ModuleList([])
-
-        for (dim_in, dim_out), (kernel, stride, padding), num_layers, ff_expansion, heads, reduction_ratio in zip(dim_pairs, stage_kernel_stride_pad, num_layers, ff_expansion, heads, reduction_ratio):
-            get_overlap_patches = nn.Unfold(kernel, stride = stride, padding = padding)
-            overlap_patch_embed = nn.Conv2d(dim_in * kernel ** 2, dim_out, 1)
-
-            layers = nn.ModuleList([])
-
-            for _ in range(num_layers):
-                layers.append(nn.ModuleList([
-                    PreNorm(dim_out, EfficientSelfAttention(dim = dim_out, heads = heads, reduction_ratio = reduction_ratio)),
-                    PreNorm(dim_out, MixFeedForward(dim = dim_out, expansion_factor = ff_expansion)),
-                ]))
-
-            self.stages.append(nn.ModuleList([
-                get_overlap_patches,
-                overlap_patch_embed,
-                layers
-            ]))
-
-    def forward(
-        self,
-        x,
-        return_layer_outputs = False
-    ):
-        h, w = x.shape[-2:]
-
-        layer_outputs = []
-        for (get_overlap_patches, overlap_embed, layers) in self.stages:
-            x = get_overlap_patches(x)
-
-            num_patches = x.shape[-1]
-            ratio = int(sqrt((h * w) / num_patches))
-            x = rearrange(x, 'b c (h w) -> b c h w', h = h // ratio)
-
-            x = overlap_embed(x)
-            for (attn, ff) in layers:
-                x = attn(x) + x
-                x = ff(x) + x
-
-            layer_outputs.append(x)
-
-        ret = x if not return_layer_outputs else layer_outputs
-        return ret
+        x = x.flatten(2).transpose(1, 2)
+        x = self.proj(x)
+        return x
+    
 
 class Segformer(nn.Module):
     def __init__(
         self,
         *,
+        pretrained=None,
         dims = (32, 64, 160, 256),
-        heads = (1, 2, 5, 8),
-        ff_expansion = (8, 8, 4, 4),
-        reduction_ratio = (8, 4, 2, 1),
-        num_layers = 2,
-        channels = 3,
         decoder_dim = 256,
-        num_classes = 4
+        num_classes = 4,
+        feature_strides=[4, 8, 16, 32],
+        dropout_ratio=0.1
     ):
-        super().__init__()
-        dims, heads, ff_expansion, reduction_ratio, num_layers = map(partial(cast_tuple, depth = 4), (dims, heads, ff_expansion, reduction_ratio, num_layers))
-        assert all([*map(lambda t: len(t) == 4, (dims, heads, ff_expansion, reduction_ratio, num_layers))]), 'only four stages are allowed, all keyword arguments must be either a single value or a tuple of 4 values'
+        super(Segformer, self).__init__()
+        
+        self.mit = mit_b5()
+        self.mit.init_weights(pretrained=pretrained)
+        
+        self.linear_c4 = MLP(input_dim=dims[3], embed_dim=decoder_dim)
+        self.linear_c3 = MLP(input_dim=dims[2], embed_dim=decoder_dim)
+        self.linear_c2 = MLP(input_dim=dims[1], embed_dim=decoder_dim)
+        self.linear_c1 = MLP(input_dim=dims[0], embed_dim=decoder_dim)
+        
+        self.linear_fuse = nn.Conv2d(4 * decoder_dim, decoder_dim, 1)
+        
+        self.dropout = nn.Dropout2d(dropout_ratio)
 
-        self.mit = MiT(
-            channels = channels,
-            dims = dims,
-            heads = heads,
-            ff_expansion = ff_expansion,
-            reduction_ratio = reduction_ratio,
-            num_layers = num_layers
-        )
-
-        self.to_fused = nn.ModuleList([nn.Sequential(
-            nn.Conv2d(dim, decoder_dim, 1),
-            nn.Upsample(scale_factor = 2 ** i)
-        ) for i, dim in enumerate(dims)])
-
-        self.to_segmentation = nn.Sequential(
-            nn.Conv2d(4 * decoder_dim, decoder_dim, 1),
-            nn.Conv2d(decoder_dim, num_classes, 1),
-        )
-
+        self.linear_pred = nn.Conv2d(decoder_dim, num_classes, kernel_size=1)
+        
+        
     def forward(self, x):
-        layer_outputs = self.mit(x, return_layer_outputs = True)
+        x = self.mit(x) # len=4, 1/4,1/8,1/16,1/32
 
-        fused = [to_fused(output) for output, to_fused in zip(layer_outputs, self.to_fused)]
-        fused = torch.cat(fused, dim = 1)
-        return self.to_segmentation(fused)
+        c1, c2, c3, c4 = x 
+
+        ############## MLP decoder on C1-C4 ###########
+        n, _, h, w = c4.shape
+        h_out, w_out = c1.size()[2]*4, c1.size()[3]*4
+
+        _c4 = self.linear_c4(c4).permute(0,2,1).reshape(n, -1, c4.shape[2], c4.shape[3])
+        _c4 = F.interpolate(_c4, size = c1.size()[2:], mode = 'bilinear', align_corners = False)
+
+        _c3 = self.linear_c3(c3).permute(0,2,1).reshape(n, -1, c3.shape[2], c3.shape[3])
+        _c3 = F.interpolate(_c3, size = c1.size()[2:], mode = 'bilinear', align_corners = False)
+
+        _c2 = self.linear_c2(c2).permute(0,2,1).reshape(n, -1, c2.shape[2], c2.shape[3])
+        _c2 = F.interpolate(_c2, size = c1.size()[2:], mode = 'bilinear', align_corners = False)
+
+        _c1 = self.linear_c1(c1).permute(0,2,1).reshape(n, -1, c1.shape[2], c1.shape[3])
+
+        _c = self.linear_fuse(torch.cat([_c4, _c3, _c2, _c1], dim = 1))
+
+        x = self.dropout(_c)
+        x = self.linear_pred(x)
+        
+        x = F.interpolate(input = x, size = (h_out, w_out), mode = 'bilinear', align_corners = False)
+        x = x.type(torch.float32)
+    
+        return x
